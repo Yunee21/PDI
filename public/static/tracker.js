@@ -23,12 +23,13 @@ function trackerLoad() {
     tracker = trackerDefault();
   }
   if (tracker.version !== 1) tracker = trackerDefault();
-  // 식단 기능을 내린 동안은 예전에 저장된 선택값도 가이드로 되돌린다
-  if (tracker.planMode === 'plan') tracker.planMode = 'guide';
+  // 식단 지수·PFS 점수를 넣기 전에 저장된 식단은 값이 없어 화면에 쓸 수 없으니 다시 추천받게 합니다
+  if (tracker.plan && (tracker.plan.score.dietIndex == null || tracker.plan.score.pfs == null)) tracker.plan = null;
   return tracker;
 }
 
 function trackerSave() {
+  if (typeof wellnessTrigger === 'function') wellnessTrigger();   // 기록·체중·프로필 변경 → 재산출 (deficit_based 모드만)
   try {
     localStorage.setItem(TRACKER_KEY, JSON.stringify(tracker));
   } catch (e) {
@@ -73,7 +74,7 @@ function planDateOf(dayIndex) {
 // ══════════════════════════════════════════════
 // 실천 기록
 // ══════════════════════════════════════════════
-// log[day][mealType] = { status: 'eaten'|'skipped'|'other', subs: [{name, portion, kcal, prfKcal}] }
+// log[day][mealType] = { status: 'eaten'|'skipped'|'other', subs: [{name, portion, kcal, fg:식품군 벡터}] }
 function mealLog(day, mealType) {
   const d = tracker.log[day] || (tracker.log[day] = {});
   return d[mealType] || (d[mealType] = { status: null, subs: [] });
@@ -83,6 +84,7 @@ function setMealStatus(day, mealType, status) {
   const e = mealLog(day, mealType);
   e.status = e.status === status ? null : status;
   if (e.status !== 'other') e.subs = [];
+  if (typeof onPlanMealStatus === 'function') onPlanMealStatus(day, mealType, e.status);   // 원터치 기록
   trackerSave();
   renderMealPlan();
   renderMonitor();
@@ -93,10 +95,9 @@ function addSubstitute(day, mealType, name, portion) {
   const base = analyzeFood(name);
   if (!base) return '「' + name + '」을(를) 찾을 수 없어요. 다른 이름으로 입력해보세요.';
   const a = scaleAnalysis(base, portion);
-  const prfKcal = a.ingredients.reduce((s, i) => s + (i.prf ? (i.kcal || 0) : 0), 0);
   const e = mealLog(day, mealType);
   e.status = 'other';
-  e.subs.push({ name, portion, kcal: Math.round(a.totalCal), prfKcal: Math.round(prfKcal) });
+  e.subs.push({ name, portion, kcal: Math.round(a.totalCal), fg: Array.from(foodGroupVector(name, a), x => +x.toFixed(3)) });
   trackerSave();
   renderMealPlan();
   renderMonitor();
@@ -115,22 +116,25 @@ function removeSubstitute(day, mealType, idx) {
 // 실제 섭취 요약 — 추천대로 먹은 끼니는 계획값, 다른 음식은 입력값, 안 먹은 끼니는 0
 function actualDay(dayIndex) {
   const plan = tracker.plan.days[dayIndex - 1];
-  let kcal = 0, prf = 0, logged = 0;
+  let kcal = 0, logged = 0;
+  const fg = new Float64Array(FG_LEN);
+  const add = v => v.forEach((x, i) => { fg[i] += x; });
   for (const meal of plan.meals) {
     const e = (tracker.log[dayIndex] || {})[meal.type];
     if (!e || !e.status) continue;
     logged++;
-    if (e.status === 'eaten')      { kcal += meal.kcal; prf += meal.prfKcal; }
-    else if (e.status === 'other') { kcal += e.subs.reduce((s, x) => s + x.kcal, 0); prf += e.subs.reduce((s, x) => s + x.prfKcal, 0); }
+    if (e.status === 'eaten')      { kcal += meal.kcal; add(meal.fg); }
+    else if (e.status === 'other') for (const x of e.subs) { kcal += x.kcal; add(x.fg); }
   }
-  if (plan.snack) { kcal += plan.snack.kcal; prf += plan.snack.prfKcal; }
-  return { kcal, prfKcal: prf, pdi: kcal > 0 ? +(prf / kcal * 100).toFixed(1) : 0, logged, total: plan.meals.length };
+  if (plan.snack) { kcal += plan.snack.kcal; add(plan.snack.fg); }
+  // 하루 기록이 너무 적으면(추정 열량 PT_MIN_KCAL 미만) 식단 지수를 내지 않습니다 — patterns.js 와 같은 기준
+  const dietIndex = fg[FG_N + 5] >= PT_MIN_KCAL ? +dietIndexOf(fg, (tracker.profile || {}).gender, null, tracker.plan.meta.dietIndexWeights).toFixed(1) : null;
+  return { kcal, dietIndex, logged, total: plan.meals.length };
 }
 
 function adherence() {
-  if (!tracker.plan) return { eaten: 0, other: 0, skipped: 0, logged: 0, total: 0, pct: 0, avgPDI: 0 };
+  if (!tracker.plan) return { eaten: 0, other: 0, skipped: 0, logged: 0, total: 0, pct: 0 };
   let eaten = 0, other = 0, skipped = 0, total = 0;
-  const pdis = [];
   const upto = planDayIndex() || tracker.plan.days.length;
   for (let d = 1; d <= Math.min(upto, tracker.plan.days.length); d++) {
     total += tracker.plan.days[d - 1].meals.length;
@@ -141,14 +145,11 @@ function adherence() {
       else if (e.status === 'other') other++;
       else skipped++;
     }
-    const a = actualDay(d);
-    if (a.logged) pdis.push(a.pdi);
   }
   const logged = eaten + other + skipped;
   return {
     eaten, other, skipped, logged, total,
     pct: total ? Math.round((eaten + other) / total * 100) : 0,
-    avgPDI: pdis.length ? +(pdis.reduce((a, b) => a + b, 0) / pdis.length).toFixed(1) : 0,
   };
 }
 
@@ -420,7 +421,7 @@ function guidePlanHtml() {
       + '<div class="flex flex-wrap gap-1.5">' + g.extra.snack.names.map(productChip).join('') + '</div></div></div>'
     : '';
 
-  return '<h3 class="text-xl font-bold text-gray-900 mb-1">30일 체중 관리 가이드</h3>'
+  return '<h3 class="text-xl font-bold text-gray-900 mb-1">30일 관리 가이드</h3>'
     + '<p class="text-gray-500 text-sm mb-5">하루 <b class="text-gray-800">' + total.toLocaleString() + ' kcal</b> 기준이에요</p>'
 
     + '<div class="text-sm font-bold text-gray-800 mb-2">끼니마다 이만큼</div>'
@@ -502,7 +503,7 @@ function payCardHtml(c, mineKey) {
     + '<div class="text-xs mb-4">' + (q.rate ? '<span class="line-through text-gray-400">' + won(q.listPrice) + '</span>'
         + ' <b class="text-emerald-700">' + q.rate + '% 할인</b>' : '<span class="text-gray-400">할인 없음</span>') + '</div>'
     + '<ul class="space-y-1.5 mb-5">'
-    + check('30일 체중 관리 가이드')
+    + check('30일 관리 가이드')
     + check('제품을 어느 끼니에 드실지 안내')
     + check('날마다 먹은 것 · 체중 기록')
     + check('제품 ' + Math.round(q.counts.soymilk + q.counts.phyto + q.counts.bar) + '팩 한 달 배송')
@@ -539,7 +540,7 @@ function renderPay() {
     + '<div class="text-sm font-bold text-gray-800 mb-2">구독하시면 이렇게 달라져요</div>'
     + '<ul class="space-y-1.5 text-sm text-gray-600">'
     + ['고른 구성에 맞춰 끼니별 칼로리와 제품 배분을 알려드려요',
-       '날마다 먹은 것과 체중을 기록하면 목표 칼로리를 다시 맞춰 드려요',
+       '날마다 먹은 것과 체중을 기록하면 목표 체중까지의 변화를 그래프로 보여드려요',
        '제품은 한 달에 한 번 배송되고, 언제든 수량을 바꾸실 수 있어요']
       .map(t => '<li class="flex gap-2"><span class="text-emerald-600">·</span><span>' + t + '</span></li>').join('')
     + '</ul></div>';
@@ -563,7 +564,7 @@ function mealPlanPromptHtml(reason) {
     + '<div class="space-y-3 mb-5">'
     + step(1, '구독 구성 정하기', '위 「맞춤 구독 세트」에서 두유·파이토100·프로틴바 수량을 정하세요', !empty)
     + step(2, '식단 추천받기', '정한 구성으로 ' + (willDays || 30) + '일 식단을 계산해요 (약 1초)', false)
-    + step(3, '매일 실천 기록', '끼니마다 먹었는지 체크하고 체중을 기록하면 목표를 다시 맞춰 드려요', false)
+    + step(3, '매일 실천 기록', '끼니마다 먹었는지 체크하고 체중을 기록하면 목표 체중까지의 변화를 보여드려요', false)
     + '</div>'
     + (empty
         ? '<div class="bg-gray-50 rounded-xl p-4 text-sm text-gray-500">제품을 1개 이상 담으면 식단을 추천받을 수 있어요.</div>'
@@ -666,8 +667,8 @@ function renderMealPlan() {
       + '<span class="text-sm font-black text-gray-900">Day ' + d.day + '</span>'
       + (date ? '<span class="text-xs text-gray-400">' + date.slice(5).replace('-', '/') + '</span>' : '')
       + (isToday ? '<span class="text-xs font-bold px-2 py-0.5 rounded-full bg-emerald-600 text-white">오늘</span>' : '')
-      + '<span class="text-xs text-gray-500 ml-auto">계획 ' + d.kcal + ' kcal · 식물성 식품 ' + d.pdi + '%</span>'
-      + (act.logged ? '<span class="text-xs font-bold text-amber-700">실제 ' + act.kcal + ' kcal · 식물성 식품 ' + act.pdi + '% (' + act.logged + '/' + act.total + '끼 기록)</span>' : '')
+      + '<span class="text-xs text-gray-500 ml-auto">계획 ' + d.kcal + ' kcal · 식단 지수 ' + d.dietIndex + '점</span>'
+      + (act.logged ? '<span class="text-xs font-bold text-amber-700">실제 ' + act.kcal + ' kcal' + (act.dietIndex != null ? ' · 식단 지수 ' + act.dietIndex + '점' : '') + ' (' + act.logged + '/' + act.total + '끼 기록)</span>' : '')
       + '</summary><div class="mt-3">' + mealsHtml + '</div>'
       + (d.snack ? '<div class="mt-2.5 pt-2.5 border-t border-gray-100 text-xs"><b class="text-gray-700">간식</b> '
           + d.snack.items.join(' + ') + ' <span class="text-gray-400">' + d.snack.kcal + ' kcal</span></div>' : '')
@@ -684,11 +685,12 @@ function renderMealPlan() {
 
     + '<div class="grid grid-cols-2 lg:grid-cols-6 gap-2 mb-4">'
     + scoreTile('영양 균형', sc.nutrition, '#6B8E73')
-    + scoreTile('식물성 식품 비율', sc.pdi, '#6B8E73', '목표 ' + m.pdiOptTarget + '%')
+    + scoreTile('식단 지수 달성도', sc.dietIndex, '#6B8E73', '목표 ' + m.dietIndexOptTarget + '점')
     + scoreTile('메뉴 다양성', sc.diversity, '#6B8E73')
     + scoreTile('메뉴 궁합', sc.harmony, '#6B8E73')
+    + scoreTile('PFS 영양 점수', sc.pfs, '#6B8E73', 'Basic 평균 ' + m.avgPfs)
     + scoreTile('평균 칼로리', m.avgKcal, '#2C5530')
-    + scoreTile('평균 식물성 비율', m.avgPDI + '%', '#2C5530', '자체 설정 목표 40%')
+    + scoreTile('평균 식단 지수', m.avgDietIndex + '점', '#2C5530', '100점 만점이에요')
     + '</div>'
     + '<div class="bg-emerald-50 border border-emerald-100 rounded-xl p-3 mb-3 text-xs text-emerald-900">'
     + '<b>밥스누 제품 배치</b> · 구독한 ' + m.coverage.totalServings + '회분을 ' + plan.days.length + '일에 나눠 넣었어요<br>'
@@ -990,14 +992,6 @@ function renderDiary() {
     }, emptyNutrients());
     const rg   = targets.ranges;
     const kcal = meals.reduce((s, m) => s + m.analysis.totalCal, 0);
-    const ig   = foodGroupIntake(meals);
-    const lacks = [];
-    if (ig.wholeGrainPct < 5)            lacks.push('통곡물');
-    if (ig.vegG < 350)                   lacks.push('채소');
-    if (ig.fruitG < 100)                 lacks.push('과일');
-    if (n.protein < rg.protein[0])       lacks.push('단백질');
-    if (n.fiber < rg.fiber)              lacks.push('식이섬유');
-
     barsHtml =
       '<div class="grid sm:grid-cols-2 gap-x-6 gap-y-4 mb-5">'
       + intakeBar('칼로리', kcal, Math.round(targets.targetKcal * 0.9), Math.round(targets.targetKcal * 1.1), 'kcal')
@@ -1006,12 +1000,16 @@ function renderDiary() {
       + intakeBar('지방', n.fat, rg.fat[0], rg.fat[1], 'g')
       + intakeBar('식이섬유', n.fiber, rg.fiber, null, 'g', 1)
       + intakeBar('나트륨', n.sodium, null, rg.sodium, 'mg')
-      + '</div>'
-      + '<div class="text-sm font-bold text-gray-800 mb-2">이 날 부족했던 것</div>'
-      + (lacks.length
-          ? '<div class="flex flex-wrap gap-1.5">' + lacks.map(x =>
-              '<span class="text-xs font-bold px-3 py-1.5 rounded-full bg-amber-100 text-amber-800">' + x + ' 섭취 부족</span>').join('') + '</div>'
-          : '<div class="text-sm text-emerald-700">부족한 것 없이 고르게 드셨어요</div>');
+      + '</div>';
+    // 그날 기록으로 식이 지표 5종을 다시 계산 (기록을 저장할 때마다 이 화면을 다시 그립니다)
+    const sc = scoreDietPatterns(meals, null, tracker.profile.gender, tracker.profile);
+    barsHtml += '<div class="text-sm font-bold text-gray-800 mb-2">이 날의 식이 지표</div>'
+      + (sc.insufficient
+        ? '<div class="bg-gray-50 rounded-2xl p-4 mb-5 text-sm text-gray-500">하루 기록이 ' + PT_MIN_KCAL + ' kcal 이상 쌓이면 점수를 보여드려요</div>'
+        : '<div class="grid grid-cols-2 sm:grid-cols-5 gap-2 mb-5">'
+          + sc.patterns.map(p => '<div class="bg-gray-50 rounded-xl px-3 py-2" title="' + p.name + '"><div class="text-xs text-gray-500">' + p.key + '</div>'
+            + '<div class="text-sm font-bold text-gray-800">' + p.score + '점</div></div>').join('')
+          + '</div>');
   }
 
   const wt = weightOf(diaryDate);
@@ -1134,6 +1132,7 @@ function renderMonitor() {
     + '<div class="text-2xl font-black" style="color:' + (color || '#111827') + '">' + value + '</div>'
     + '<div class="text-xs text-gray-400 mt-1">' + sub + '</div></div>';
 
+  const hasPlan = planMode() === 'plan' && !!tracker.plan;
   const retargetHtml = !rt.ready
     ? '<div class="bg-gray-50 rounded-xl p-3.5 text-sm text-gray-600">' + rt.reason + '</div>'
     : rt.onTrack
@@ -1143,8 +1142,9 @@ function renderMonitor() {
         + '<div class="text-sm font-bold text-amber-900 mb-1">목표 재조정 제안</div>'
         + '<div class="text-xs text-amber-800">계획 ' + rt.planned + ' kg/주 → 실제 <b>' + tr.perWeek + ' kg/주</b> (차이 ' + (rt.gap > 0 ? '+' : '') + rt.gap + ')<br>'
         + '목표 칼로리를 <b>' + targets.targetKcal.toLocaleString() + ' → ' + rt.newTargetKcal.toLocaleString() + ' kcal</b>'
-        + ' (' + (rt.delta > 0 ? '+' : '') + rt.delta + ') 로 조정하고 남은 식단을 다시 만들어요.</div>'
-        + '<button type="button" onclick="applyRetarget(' + rt.newTargetKcal + ')" class="mt-2 text-xs font-bold px-3 py-1.5 rounded-lg bg-amber-500 text-white">목표 적용 + 식단 재생성</button>'
+        + ' (' + (rt.delta > 0 ? '+' : '') + rt.delta + ') 로 바꿔 보세요.' + (hasPlan ? ' 적용하면 식단도 새 목표로 다시 짜요.' : '') + '</div>'
+        + '<button type="button" onclick="applyRetarget(' + rt.newTargetKcal + ', true)" class="mt-2 text-xs font-bold px-3 py-1.5 rounded-lg bg-amber-500 text-white">'
+        + (hasPlan ? '목표 적용 + 식단 재생성' : '목표 적용') + '</button>'
         + '</div>';
 
   el.innerHTML =
@@ -1153,7 +1153,8 @@ function renderMonitor() {
     + '<div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-5">'
     + tile('현재 체중', cur + ' kg', 'BMI ' + bmi.toFixed(1) + ' · ' + bt.name, '#2C5530')
     + tile('누적 변화', (tr ? (tr.total > 0 ? '+' : '') + tr.total + ' kg' : '–'), tr ? tr.spanDays + '일간 · ' + tr.perWeek + ' kg/주' : '2회 이상 기록 필요', tr && tr.total < 0 ? '#6B8E73' : '#B45309')
-    + tile('표준 체중까지', (Math.round((cur - targets.targetWeight) * 10) / 10) + ' kg', 'BMI 22 기준 ' + targets.targetWeight + ' kg', '#6B8E73')
+    + tile('목표 체중까지', (Math.round((cur - targets.targetWeight) * 10) / 10) + ' kg',
+           (tracker.profile.targetWeight > 0 ? '목표 ' : 'BMI 22 기준 ') + targets.targetWeight + ' kg', '#6B8E73')
     + tile('식단 실천율', ad.pct + '%', ad.logged + '/' + ad.total + '끼 기록', '#2C5530')
     + '</div>'
 
@@ -1194,6 +1195,7 @@ function drawWeightChart() {
       datasets: [
         { label: '실제 체중', data: actual, borderColor: '#059669', backgroundColor: '#05966922', spanGaps: true, tension: 0.3, pointRadius: 4 },
         { label: '계획 추세', data: planned, borderColor: '#9CA3AF', borderDash: [5, 4], pointRadius: 0, tension: 0 },
+        { label: '목표 체중', data: labels.map(() => targets.targetWeight), borderColor: '#D97706', borderWidth: 1.5, pointRadius: 0, tension: 0 },
       ],
     },
     options: {
